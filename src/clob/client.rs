@@ -36,12 +36,13 @@ use crate::clob::types::request::{
 };
 use crate::clob::types::response::{
     ApiKeysResponse, BalanceAllowanceResponse, BanStatusResponse, BuilderApiKeyResponse,
-    BuilderTradeResponse, CancelOrdersResponse, CurrentRewardResponse, FeeRateResponse,
-    GeoblockResponse, HeartbeatResponse, LastTradePriceResponse, LastTradesPricesResponse,
-    MarketResponse, MarketRewardResponse, MidpointResponse, MidpointsResponse, NegRiskResponse,
-    NotificationResponse, OpenOrderResponse, OrderBookSummaryResponse, OrderScoringResponse,
-    OrdersScoringResponse, Page, PostOrderResponse, PriceHistoryResponse, PriceResponse,
-    PricesResponse, RewardsPercentagesResponse, SimplifiedMarketResponse, SpreadResponse,
+    BuilderFeeRateResponse, BuilderTradeResponse, CancelOrdersResponse, ClobMarketInfoResponse,
+    CurrentRewardResponse, FeeRateResponse, GeoblockResponse, HeartbeatResponse,
+    LastTradePriceResponse, LastTradesPricesResponse, MarketResponse, MarketRewardResponse,
+    MidpointResponse, MidpointsResponse, NegRiskResponse, NotificationResponse,
+    OpenOrderResponse, OrderBookSummaryResponse, OrderScoringResponse, OrdersScoringResponse,
+    Page, PostOrderResponse, PriceHistoryResponse, PriceResponse, PricesResponse,
+    ReadonlyApiKeyResponse, RewardsPercentagesResponse, SimplifiedMarketResponse, SpreadResponse,
     SpreadsResponse, TickSizeResponse, TotalUserEarningResponse, TradeResponse,
     UserEarningResponse, UserRewardsEarningResponse,
 };
@@ -54,7 +55,7 @@ use crate::clob::types::{
 };
 use crate::clob::types::{SignableOrder, SignatureType, SignedOrder, TickSize};
 use crate::error::{Error, Kind as ErrorKind, Synchronization};
-use crate::types::Address;
+use crate::types::{Address, B256};
 use crate::{
     AMOY, POLYGON, Result, Timestamp, ToQueryParams as _, auth, contract_config,
     derive_proxy_wallet, derive_safe_wallet,
@@ -222,6 +223,7 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
+                builder_fee_rates: inner.builder_fee_rates,
                 funder,
                 signature_type: self.signature_type.unwrap_or(SignatureType::Eoa),
                 salt_generator: self.salt_generator.unwrap_or(generate_seed),
@@ -405,6 +407,8 @@ struct ClientInner<S: State> {
     neg_risk: DashMap<U256, bool>,
     /// Local cache representing the fee rate in basis points per token ID
     fee_rate_bps: DashMap<U256, u32>,
+    /// Local cache of builder fee rates per builder code
+    builder_fee_rates: DashMap<B256, BuilderFeeRateResponse>,
     /// The funder for this [`ClientInner`]. If funder is present, then `signature_type` cannot
     /// be [`SignatureType::Eoa`]. Conversely, if funder is absent, then `signature_type` cannot be
     /// [`SignatureType::Proxy`] or [`SignatureType::GnosisSafe`].
@@ -513,6 +517,7 @@ impl<S: State> Client<S> {
         self.inner.tick_sizes.clear();
         self.inner.fee_rate_bps.clear();
         self.inner.neg_risk.clear();
+        self.inner.builder_fee_rates.clear();
     }
 
     /// Pre-populates the tick size cache for a token, avoiding the HTTP call.
@@ -1170,6 +1175,60 @@ impl<S: State> Client<S> {
         }
     }
 
+    /// Returns combined CLOB market info for a condition ID.
+    ///
+    /// This endpoint (`GET /clob-markets/{condition_id}`) returns tick size, neg risk,
+    /// fee rate, and token data in a single call. It also populates the local caches
+    /// for tick size, neg risk, and fee rate for all tokens in the market.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn clob_market_info(
+        &self,
+        condition_id: &str,
+    ) -> Result<ClobMarketInfoResponse> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}clob-markets/{condition_id}", self.host()),
+            )
+            .build()?;
+
+        let response: ClobMarketInfoResponse =
+            crate::request(&self.inner.client, request, None).await?;
+
+        // Prime local caches from the response
+        for token in &response.tokens {
+            self.inner.tick_sizes.insert(token.token_id, response.min_tick_size);
+            self.inner.neg_risk.insert(token.token_id, response.neg_risk);
+            self.inner.fee_rate_bps.insert(token.token_id, response.fee_rate_bps);
+        }
+
+        Ok(response)
+    }
+
+    /// Looks up a market by token ID.
+    ///
+    /// This is used internally for cache priming when the condition ID for a token
+    /// is not yet known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn market_by_token(&self, token_id: U256) -> Result<MarketResponse> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}markets-by-token/{token_id}", self.host()),
+            )
+            .build()?;
+
+        crate::request(&self.inner.client, request, None).await
+    }
+
     fn client(&self) -> &ReqwestClient {
         &self.inner.client
     }
@@ -1227,6 +1286,7 @@ impl Client<Unauthenticated> {
                 tick_sizes: DashMap::new(),
                 neg_risk: DashMap::new(),
                 fee_rate_bps: DashMap::new(),
+                builder_fee_rates: DashMap::new(),
                 state: Unauthenticated,
                 funder: None,
                 signature_type: SignatureType::Eoa,
@@ -1339,6 +1399,7 @@ impl<K: Kind> Client<Authenticated<K>> {
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
+                builder_fee_rates: inner.builder_fee_rates,
                 // Reset the order parameters that were previously stored on the client
                 funder: None,
                 signature_type: SignatureType::Eoa,
@@ -1992,6 +2053,121 @@ impl<K: Kind> Client<Authenticated<K>> {
         crate::request(&self.inner.client, request, Some(headers)).await
     }
 
+    /// Creates a new read-only API key.
+    ///
+    /// Read-only keys can access account data but cannot place or cancel orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn create_readonly_api_key(&self) -> Result<ReadonlyApiKeyResponse> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}auth/readonly-api-key", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
+    /// Lists all read-only API keys for the authenticated user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn readonly_api_keys(&self) -> Result<Vec<ReadonlyApiKeyResponse>> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}auth/readonly-api-keys", self.host()))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
+    /// Deletes a read-only API key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the key cannot be deleted.
+    pub async fn delete_readonly_api_key(&self, key: &str) -> Result<()> {
+        let mut request = self
+            .client()
+            .request(
+                Method::DELETE,
+                format!("{}auth/readonly-api-key", self.host()),
+            )
+            .json(&serde_json::json!({ "key": key }))
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        *request.headers_mut() = headers;
+        self.inner.client.execute(request).await?;
+
+        Ok(())
+    }
+
+    /// Gets pre-migration orders (legacy V1 orders) for the authenticated user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn pre_migration_orders(
+        &self,
+        next_cursor: Option<String>,
+    ) -> Result<Page<OpenOrderResponse>> {
+        let cursor = next_cursor
+            .map(|c| format!("?next_cursor={c}"))
+            .unwrap_or_default();
+
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}data/pre-migration-orders{cursor}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        crate::request(&self.inner.client, request, Some(headers)).await
+    }
+
+    /// Gets the builder fee rate for a given builder code, with local caching.
+    ///
+    /// The server returns fee rates in basis points. The response contains the raw
+    /// BPS values; callers should divide by 10000 to get decimal rates.
+    ///
+    /// Results are cached per builder code. Use [`Client::invalidate_internal_caches`]
+    /// to clear.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    pub async fn builder_fee_rate(
+        &self,
+        builder_code: B256,
+    ) -> Result<BuilderFeeRateResponse> {
+        if let Some(cached) = self.inner.builder_fee_rates.get(&builder_code) {
+            return Ok(cached.clone());
+        }
+
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}fees/builder-fees/{builder_code}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+
+        let response: BuilderFeeRateResponse =
+            crate::request(&self.inner.client, request, Some(headers)).await?;
+
+        self.inner.builder_fee_rates.insert(builder_code, response.clone());
+
+        Ok(response)
+    }
+
     /// Creates a new Builder API key for order attribution.
     ///
     /// Builder API keys allow you to attribute orders to your builder account,
@@ -2202,6 +2378,7 @@ impl Client<Authenticated<Normal>> {
             tick_sizes: inner.tick_sizes,
             neg_risk: inner.neg_risk,
             fee_rate_bps: inner.fee_rate_bps,
+            builder_fee_rates: inner.builder_fee_rates,
             funder: inner.funder,
             signature_type: inner.signature_type,
             salt_generator: inner.salt_generator,
