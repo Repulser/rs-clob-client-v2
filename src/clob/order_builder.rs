@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{B256, U256};
+use alloy::signers::Signer;
 use chrono::{DateTime, Utc};
 use rand::RngExt as _;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -11,6 +12,7 @@ use crate::auth::Kind as AuthKind;
 use crate::auth::state::Authenticated;
 use crate::clob::Client;
 use crate::clob::types::request::OrderBookSummaryRequest;
+use crate::clob::types::response::PostOrderResponse;
 use crate::clob::types::{
     Amount, AmountInner, Order, OrderPayload, OrderType, Side, SignableOrder, SignatureType,
 };
@@ -51,6 +53,7 @@ pub struct OrderBuilder<OrderKind, K: AuthKind> {
     pub(crate) metadata: Option<B256>,
     pub(crate) builder_code: Option<B256>,
     pub(crate) defer_exec: Option<bool>,
+    pub(crate) user_usdc_balance: Option<Decimal>,
     pub(crate) _kind: PhantomData<OrderKind>,
 }
 
@@ -269,6 +272,18 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
             defer_exec: self.defer_exec,
         })
     }
+
+    /// Convenience: builds, signs, and posts this limit order in a single call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the build, sign, or post steps fails.
+    pub async fn build_sign_and_post<S: Signer>(self, signer: &S) -> Result<PostOrderResponse> {
+        let client = self.client.clone();
+        let order = self.build().await?;
+        let signed = client.sign(signer, order).await?;
+        client.post_order(signed).await
+    }
 }
 
 impl<K: AuthKind> OrderBuilder<Market, K> {
@@ -283,6 +298,15 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
     #[must_use]
     pub fn amount(mut self, amount: Amount) -> Self {
         self.amount = Some(amount);
+        self
+    }
+
+    /// Sets the user's USDC balance. When set on a BUY market order, `build()` shrinks
+    /// the USDC amount to cover platform + builder taker fees so the order stays within
+    /// the user's balance.
+    #[must_use]
+    pub fn user_usdc_balance(mut self, balance: Decimal) -> Self {
+        self.user_usdc_balance = Some(balance);
         self
     }
 
@@ -408,6 +432,34 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
             )));
         }
 
+        let amount = match (side, amount.0, self.user_usdc_balance) {
+            (Side::Buy, AmountInner::Usdc(raw), Some(balance))
+                if matches!(order_type, OrderType::FOK | OrderType::FAK) =>
+            {
+                let fee = self.client.fee_rate_bps(token_id).await?;
+                let fee_rate = Decimal::from(fee.base_fee) / Decimal::from(10_000_u32);
+                let fee_exponent = Decimal::from(fee.exponent.unwrap_or(0));
+                let builder_taker_fee = match self.builder_code {
+                    Some(code) if code != B256::ZERO => {
+                        let rate = self.client.builder_fee_rate(code).await?;
+                        Decimal::from(rate.builder_taker_fee_rate_bps) / Decimal::from(10_000_u32)
+                    }
+                    _ => Decimal::ZERO,
+                };
+
+                let adjusted = super::utilities::adjust_market_buy_amount(
+                    raw,
+                    balance,
+                    price,
+                    fee_rate,
+                    fee_exponent,
+                    builder_taker_fee,
+                );
+                Amount::usdc(adjusted)?
+            }
+            _ => amount,
+        };
+
         let raw_amount = amount.as_inner();
 
         let (taker_amount, maker_amount) = match (side, amount.0) {
@@ -464,6 +516,18 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
             post_only: None,
             defer_exec: self.defer_exec,
         })
+    }
+
+    /// Convenience: builds, signs, and posts this market order in a single call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the build, sign, or post steps fails.
+    pub async fn build_sign_and_post<S: Signer>(self, signer: &S) -> Result<PostOrderResponse> {
+        let client = self.client.clone();
+        let order = self.build().await?;
+        let signed = client.sign(signer, order).await?;
+        client.post_order(signed).await
     }
 }
 

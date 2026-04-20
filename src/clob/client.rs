@@ -53,9 +53,9 @@ use crate::clob::types::{
     CreateRfqRequestRequest, CreateRfqRequestResponse, RfqQuote, RfqQuotesRequest, RfqRequest,
     RfqRequestsRequest,
 };
-use crate::clob::types::{SignableOrder, SignatureType, SignedOrder, TickSize};
+use crate::clob::types::{OrderType, Side, SignableOrder, SignatureType, SignedOrder, TickSize};
 use crate::error::{Error, Kind as ErrorKind, Synchronization};
-use crate::types::{Address, B256};
+use crate::types::{Address, B256, Decimal};
 use crate::{
     AMOY, POLYGON, Result, Timestamp, ToQueryParams as _, auth, contract_config,
     derive_proxy_wallet, derive_safe_wallet,
@@ -1227,6 +1227,55 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
+    /// Returns raw on-chain trade events for a market condition ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the condition ID is invalid.
+    pub async fn market_trades_events(&self, condition_id: &str) -> Result<serde_json::Value> {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}markets/live-activity/{condition_id}", self.host()),
+            )
+            .build()?;
+
+        crate::request(&self.inner.client, request, None).await
+    }
+
+    /// Calculates the effective fill price for a market order by walking the orderbook.
+    ///
+    /// Fetches the orderbook for `token_id` and delegates to
+    /// [`crate::clob::utilities::calculate_market_price`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the orderbook request fails or there is no liquidity
+    /// and `order_type` is [`OrderType::FOK`].
+    pub async fn calculate_market_price(
+        &self,
+        token_id: U256,
+        side: Side,
+        amount: Decimal,
+        order_type: OrderType,
+    ) -> Result<Decimal> {
+        let book = self
+            .order_book(&OrderBookSummaryRequest {
+                token_id,
+                side: None,
+            })
+            .await?;
+
+        super::utilities::calculate_market_price(&book, side, amount, &order_type).ok_or_else(
+            || {
+                Error::validation(format!(
+                    "Insufficient liquidity to fill {amount} on {side:?} for {token_id}"
+                ))
+            },
+        )
+    }
+
     fn client(&self) -> &ReqwestClient {
         &self.inner.client
     }
@@ -2323,6 +2372,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             metadata: None,
             builder_code: None,
             defer_exec: None,
+            user_usdc_balance: None,
             client: Client {
                 inner: Arc::clone(&self.inner),
                 #[cfg(feature = "heartbeats")]
