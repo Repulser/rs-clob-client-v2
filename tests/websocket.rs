@@ -849,6 +849,35 @@ mod reconnection {
         config
     }
 
+    fn config_fast_heartbeat() -> Config {
+        let mut config = config();
+        config.heartbeat_interval = Duration::from_millis(25);
+        config.heartbeat_timeout = Duration::from_millis(75);
+        config
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_heartbeat_timeout_without_pong() {
+        let mut server = ReconnectableMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+
+        // Mock server intentionally ignores PING frames in this test module.
+        // A healthy client should detect heartbeat timeout and reconnect.
+        let client = Client::new(&endpoint, config_fast_heartbeat()).unwrap();
+
+        let asset_id = payloads::asset_id();
+        let _stream = client.subscribe_orderbook(vec![asset_id]).unwrap();
+
+        let initial = server.recv_subscription().await;
+        assert!(initial.is_some(), "Should receive initial subscription");
+
+        let resub = server.recv_subscription().await;
+        assert!(
+            resub.is_some(),
+            "Should re-subscribe after heartbeat timeout when no PONG is received"
+        );
+    }
+
     #[tokio::test]
     async fn resubscribes_and_receives_messages_after_reconnect() {
         let mut server = ReconnectableMockServer::start().await;

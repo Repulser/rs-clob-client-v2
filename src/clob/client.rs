@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(feature = "heartbeats")]
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -372,6 +371,38 @@ pub struct Config {
     /// headers. This adds another round trip to the requests.
     #[builder(default)]
     use_server_time: bool,
+    /// Force the underlying HTTP client to use HTTP/2 only.
+    ///
+    /// This should only be enabled when the target endpoint and any intermediary proxies support
+    /// HTTP/2. If they do not, requests will fail instead of falling back to HTTP/1.1.
+    #[builder(default)]
+    force_http2: bool,
+    /// Reqwest connect timeout used by the underlying HTTP client.
+    ///
+    /// Without this, network/DNS/TLS stalls can hang indefinitely and starve Tokio runtimes.
+    #[builder(default = Duration::from_secs(3))]
+    connect_timeout: Duration,
+    /// Overall per-request timeout used by the underlying HTTP client.
+    ///
+    /// This is a last-resort safety net in addition to any higher-level timeboxing.
+    #[builder(default = Duration::from_secs(8))]
+    request_timeout: Duration,
+    /// How long idle pooled connections are retained by the underlying HTTP client.
+    #[builder(default = Duration::from_secs(300))]
+    pool_idle_timeout: Duration,
+    /// How often HTTP/2 keepalive pings are sent when the transport is active.
+    ///
+    /// This is ignored unless the underlying transport is HTTP/2.
+    #[builder(default = Duration::from_secs(15))]
+    http2_keep_alive_interval: Duration,
+    /// How long to wait for an HTTP/2 keepalive ACK before considering the connection unhealthy.
+    ///
+    /// This is ignored unless HTTP/2 keepalive is enabled.
+    #[builder(default = Duration::from_secs(5))]
+    http2_keep_alive_timeout: Duration,
+    /// Whether HTTP/2 keepalive pings should continue while the connection is otherwise idle.
+    #[builder(default = true)]
+    http2_keep_alive_while_idle: bool,
     /// Override for the geoblock API host. Defaults to `https://polymarket.com`.
     /// This is primarily useful for testing.
     #[builder(into)]
@@ -389,6 +420,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             use_server_time: false,
+            force_http2: false,
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(8),
+            pool_idle_timeout: Duration::from_secs(300),
+            http2_keep_alive_interval: Duration::from_secs(15),
+            http2_keep_alive_timeout: Duration::from_secs(5),
+            http2_keep_alive_while_idle: true,
             geoblock_host: None,
             builder_code: None,
             #[cfg(feature = "heartbeats")]
@@ -1429,7 +1467,23 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let mut client_builder = ReqwestClient::builder()
+            .default_headers(headers)
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .http2_keep_alive_interval(config.http2_keep_alive_interval)
+            .http2_keep_alive_timeout(config.http2_keep_alive_timeout);
+
+        if config.force_http2 {
+            client_builder = client_builder.http2_prior_knowledge();
+        }
+
+        if config.http2_keep_alive_while_idle {
+            client_builder = client_builder.http2_keep_alive_while_idle(true);
+        }
+
+        let client = client_builder.build()?;
 
         let geoblock_host = Url::parse(
             config

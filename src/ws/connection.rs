@@ -238,13 +238,22 @@ where
         // Channel to notify heartbeat loop when PONG is received
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        let heartbeat_timeout = config.heartbeat_timeout;
 
-        let heartbeat_handle = tokio::spawn(async move {
-            Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
+        let heartbeat_config = config.clone();
+        let mut heartbeat_handle = tokio::spawn(async move {
+            Self::heartbeat_loop(ping_tx, state_rx, &heartbeat_config, pong_rx).await;
         });
 
         loop {
             tokio::select! {
+                // Heartbeat loop exited (timeout/closed): force reconnect by ending this connection.
+                _ = &mut heartbeat_handle => {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Heartbeat loop ended, reconnecting WebSocket");
+                    break;
+                }
+
                 // Handle incoming messages
                 Some(msg) = read.next() => {
                     match msg {
@@ -294,14 +303,26 @@ where
 
                 // Handle outgoing messages from subscriptions
                 Some(text) = sender_rx.recv() => {
-                    if write.send(Message::Text(text.into())).await.is_err() {
+                    let send_result = timeout(
+                        heartbeat_timeout,
+                        write.send(Message::Text(text.into())),
+                    )
+                    .await;
+
+                    if send_result.is_err() || send_result.is_ok_and(|r| r.is_err()) {
                         break;
                     }
                 }
 
                 // Handle PING requests from heartbeat loop
                 Some(()) = ping_rx.recv() => {
-                    if write.send(Message::Text("PING".into())).await.is_err() {
+                    let ping_result = timeout(
+                        heartbeat_timeout,
+                        write.send(Message::Text("PING".into())),
+                    )
+                    .await;
+
+                    if ping_result.is_err() || ping_result.is_ok_and(|r| r.is_err()) {
                         break;
                     }
                 }

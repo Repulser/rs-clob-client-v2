@@ -264,13 +264,38 @@ async fn request<Response: DeserializeOwned>(
     headers: Option<HeaderMap>,
 ) -> Result<Response> {
     let method = request.method().clone();
-    let path = request.url().path().to_owned();
+    let url = request.url().clone();
+    let path = url.path().to_owned();
+    let has_extra_headers = headers.is_some();
+    let t0 = std::time::Instant::now();
 
     if let Some(h) = headers {
         request.headers_mut().extend(h);
     }
 
-    let response = client.execute(request).await?;
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        method = %method,
+        url = %url,
+        has_extra_headers,
+        "API request begin"
+    );
+
+    let response = match client.execute(request).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                method = %method,
+                url = %url,
+                has_extra_headers,
+                elapsed_ms = t0.elapsed().as_millis(),
+                error = %err,
+                "API request transport error"
+            );
+            return Err(err.into());
+        }
+    };
     let status_code = response.status();
 
     #[cfg(feature = "tracing")]
@@ -284,6 +309,8 @@ async fn request<Response: DeserializeOwned>(
             status = %status_code,
             method = %method,
             path = %path,
+            url = %url,
+            elapsed_ms = t0.elapsed().as_millis(),
             message = %message,
             "API request failed"
         );
@@ -295,10 +322,23 @@ async fn request<Response: DeserializeOwned>(
     let response_data: Option<Response> = serde_helpers::deserialize_with_warnings(json_value)?;
 
     if let Some(response) = response_data {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            method = %method,
+            url = %url,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "API request complete"
+        );
         Ok(response)
     } else {
         #[cfg(feature = "tracing")]
-        tracing::warn!(method = %method, path = %path, "API resource not found");
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            url = %url,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "API resource not found"
+        );
         Err(Error::status(
             StatusCode::NOT_FOUND,
             method,

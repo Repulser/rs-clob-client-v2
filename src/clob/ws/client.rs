@@ -375,7 +375,7 @@ impl<S: State> Client<S> {
     /// Returns `false` if no subscriptions have been made yet for this channel.
     #[must_use]
     pub fn is_connected(&self, channel_type: ChannelType) -> bool {
-        self.inner.channel(channel_type).is_some()
+        self.connection_state(channel_type).is_connected()
     }
 
     /// Get the number of active subscriptions.

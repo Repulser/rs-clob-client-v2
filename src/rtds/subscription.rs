@@ -84,11 +84,16 @@ impl SubscriptionManager {
 
     /// Start the reconnection handler that re-subscribes on connection recovery.
     pub fn start_reconnection_handler(self: &Arc<Self>) {
-        let this = Arc::clone(self);
+        let this = Arc::downgrade(self);
 
         tokio::spawn(async move {
-            let mut state_rx = this.connection.state_receiver();
+            let Some(manager) = this.upgrade() else {
+                return;
+            };
+
+            let mut state_rx = manager.connection.state_receiver();
             let mut was_connected = state_rx.borrow().is_connected();
+            drop(manager);
 
             loop {
                 // Wait for next state change
@@ -105,7 +110,11 @@ impl SubscriptionManager {
                             // Reconnect to subscriptions
                             #[cfg(feature = "tracing")]
                             tracing::debug!("RTDS reconnected, re-establishing subscriptions");
-                            this.resubscribe_all();
+                            if let Some(manager) = this.upgrade() {
+                                manager.resubscribe_all();
+                            } else {
+                                break;
+                            }
                         }
                         was_connected = true;
                     }
